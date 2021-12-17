@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -165,7 +166,13 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	// the default initial term is set as 1
+	return &Raft{
+		id: c.ID,
+		Term: 1,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout: c.ElectionTick,
+	}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -186,13 +193,34 @@ func (r *Raft) tick() {
 }
 
 // becomeFollower transform this peer's state to Follower
-func (r *Raft) becomeFollower(term uint64, lead uint64) {
+func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 	// Your Code Here (2A).
+	// Do sanity check: whether term is outdated or potential leader is itself
+	if term < r.Term {
+		return fmt.Errorf("Fail to become a follower of an outdated leader")
+	}
+	if lead == r.Lead {
+		return fmt.Errorf("Fail to become a follower of itself")
+	}
+	// Synchronize to leader's term
+	r.State = StateFollower
+	r.Term = term
+	r.Lead = lead
+	return nil
 }
 
 // becomeCandidate transform this peer's state to candidate
-func (r *Raft) becomeCandidate() {
+func (r *Raft) becomeCandidate() error {
 	// Your Code Here (2A).
+	// Start election in a new term and reset election timer
+	r.State = StateCandidate
+	r.Term += 1
+	r.electionElapsed = 0
+	// Vote for itself
+	r.Vote = r.id
+	// Send RequestVote RPC to all other servers
+	// TODO...
+	return nil
 }
 
 // becomeLeader transform this peer's state to leader
