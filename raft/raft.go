@@ -17,7 +17,8 @@ package raft
 import (
 	"errors"
 	"fmt"
-
+	"math/rand"
+	"time"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -134,7 +135,7 @@ type Raft struct {
 
 	// heartbeat interval, should send
 	heartbeatTimeout int
-	// baseline of election interval
+	// the interval of maintaining current state without receiving messages
 	electionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
@@ -143,6 +144,9 @@ type Raft struct {
 	// Number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
 	electionElapsed int
+
+	// baseline of election interval
+	electionTimeoutBase int
 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
@@ -166,30 +170,94 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	// the default initial term is set as 1
-	return &Raft{
-		id: c.ID,
-		Term: 1,
-		heartbeatTimeout: c.HeartbeatTick,
-		electionTimeout: c.ElectionTick,
+	raft := new (Raft)
+	hardState, _, _ := c.Storage.InitialState()
+	raft.id = c.ID
+	raft.Term = hardState.Term
+	raft.Vote = hardState.Vote
+	raft.RaftLog = newLog(c.Storage)
+	// Init Match index as 0 and Next index as 1 for each nodes
+	raft.Prs = make(map[uint64]*Progress)
+	for _, id := range c.peers {
+		raft.Prs[id] = &Progress{
+			Match: 0,
+			Next: 1,
+		}
 	}
+	raft.State = StateFollower
+	// votes, msgs, Lead, leadTransferee and PendingConfIndex are not initialized
+	// Randomize election timeout to avoid split vote
+	raft.heartbeatTimeout = c.HeartbeatTick
+	raft.electionTimeoutBase = c.ElectionTick
+	raft.setRandomElectionTimeout()
+	raft.heartbeatElapsed = 0
+	raft.electionElapsed = 0
+	return raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	if r.State != StateLeader {
+		return false
+	}
+	msg := new (pb.Message)
+	msg.MsgType = pb.MessageType_MsgAppend
+	msg.To = to
+	msg.From = r.id
+	msg.Term = r.Term
+	// I don't know what to assign to msg.Index and msg.LogTerm
+	progress := r.Prs[to]
+	msg.Entries = transferToPointerList(r.RaftLog.copyEntriesAfter(progress.Next))
+	if msg.Entries == nil {
+		return false
+	}
+	msg.Commit = r.RaftLog.committed
+	// Send the message by appending it to the message list
+	r.msgs = append(r.msgs, *msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
+// Return true if a heartbeat is sent
+func (r *Raft) sendHeartbeat(to uint64) bool {
 	// Your Code Here (2A).
+	if r.State != StateLeader {
+		return false
+	}
+	msg := new (pb.Message)
+	msg.MsgType = pb.MessageType_MsgHeartbeat
+	msg.To = to
+	msg.From = r.id
+	msg.Term = r.Term
+	// send the message by appending it to the message list
+	r.msgs = append(r.msgs, *msg)
+	return true
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	if r.State == StateLeader {
+		// For a leader, it just needs to send heartbeat periodically
+		r.heartbeatElapsed++
+		if r.heartbeatElapsed == r.heartbeatTimeout {
+			for id, _ := range r.Prs {
+				if id != r.id {
+					r.sendHeartbeat(id)
+				}
+			}
+		}
+	} else {
+		// For a candidate or follower, if it hasn't got the message from
+		// the leader for a long time, it will become a candidate and
+		// start an election
+		r.electionElapsed++
+		if r.electionElapsed == r.electionTimeout {
+			r.becomeCandidate()
+		}
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -202,10 +270,17 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 	if lead == r.Lead {
 		return fmt.Errorf("Fail to become a follower of itself")
 	}
-	// Synchronize to leader's term
-	r.State = StateFollower
+	// Synchronize to leader's term and return no error
 	r.Term = term
+	r.Vote = lead
+	r.State = StateFollower
 	r.Lead = lead
+	// Reset election timeout
+	r.electionElapsed = 0
+	err := r.setRandomElectionTimeout()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -213,13 +288,16 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 func (r *Raft) becomeCandidate() error {
 	// Your Code Here (2A).
 	// Start election in a new term and reset election timer
-	r.State = StateCandidate
 	r.Term += 1
-	r.electionElapsed = 0
 	// Vote for itself
 	r.Vote = r.id
-	// Send RequestVote RPC to all other servers
-	// TODO...
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
+	r.State = StateCandidate
+	// Reset election timeout
+	r.electionElapsed = 0
+	r.setRandomElectionTimeout()
+	// Send RequestVote RPC to all the other servers ???
 	return nil
 }
 
@@ -227,17 +305,18 @@ func (r *Raft) becomeCandidate() error {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.Lead = r.id
+	// Reset election timeout
+	r.electionElapsed = 0
+	r.setRandomElectionTimeout()
+	r.heartbeatElapsed = 0
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-	case StateCandidate:
-	case StateLeader:
-	}
 	return nil
 }
 
@@ -264,4 +343,16 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// setRandomElectionTimeout sets electionTimeout
+// as rand[ electionTimeoutBase, 1.5*electionTimeoutBase ] to avoid split vote
+// If electionTimeoutBase <= 0, return an error
+func (r *Raft) setRandomElectionTimeout() error {
+	if r.electionTimeoutBase <= 0 {
+		return fmt.Errorf("electionTimeoutBase should be positive")
+	}
+	rand.Seed(time.Now().Unix())
+	r.electionTimeout = r.electionTimeoutBase + rand.Intn(r.electionTimeoutBase) / 2
+	return nil
 }

@@ -89,3 +89,30 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	return 0, nil
 }
+
+// copyEntriesAfter deep copies l.entries[start:] into dst
+// If start >= len(l.entries), return nil
+func (l *RaftLog) copyEntriesAfter(start uint64) ([]pb.Entry) {
+	len := uint64(len(l.entries))
+	if start > len {
+		return nil
+	}
+	dst := make([]pb.Entry, len - start)
+	copy(dst, l.entries[start:])
+	return dst
+}
+
+// transferToPointerList transfers a list of entries to list of entry pointers
+// If entries is nil, then return nil
+func transferToPointerList(entries []pb.Entry) ([]*pb.Entry) {
+	if entries == nil {
+		return nil
+	}
+	dst := make([]*pb.Entry, len(entries))
+	for i, entry := range entries {
+		entryPtr := new(pb.Entry)
+		*entryPtr = entry
+		dst[i] = entryPtr
+	}
+	return dst
+}
