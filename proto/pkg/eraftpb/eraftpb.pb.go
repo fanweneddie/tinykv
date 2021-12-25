@@ -219,6 +219,17 @@ func (m *Entry) GetData() []byte {
 	return nil
 }
 
+// IsEqualEntry checks whether the given entry is equal to this entry
+// If two entries in different logs have the same index and term,
+// then they store the same command.
+func (m *Entry) IsEqualEntry(entry Entry) bool {
+	if m.Term == entry.Term && m.Index == entry.Index {
+		return true
+	} else {
+		return false
+	}
+}
+
 // SnapshotMetadata contains the log index and term of the last log applied to this
 // Snapshot, along with the membership information of the time the last log applied.
 type SnapshotMetadata struct {

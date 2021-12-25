@@ -17,9 +17,9 @@ package raft
 import (
 	"errors"
 	"fmt"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"time"
-	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -202,20 +202,31 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if r.State != StateLeader {
 		return false
 	}
-	msg := new (pb.Message)
+
+	var msg pb.Message
 	msg.MsgType = pb.MessageType_MsgAppend
 	msg.To = to
 	msg.From = r.id
 	msg.Term = r.Term
-	// I don't know what to assign to msg.Index and msg.LogTerm
 	progress := r.Prs[to]
-	msg.Entries = transferToPointerList(r.RaftLog.copyEntriesAfter(progress.Next))
+	if progress == nil {
+		return false
+	}
+	// Set prevLogIndex and prevLogTerm to msg
+	msg.Index = progress.Next - 1
+	var err error
+	msg.LogTerm, err = r.RaftLog.Term(msg.Index - 1)
+	if err != nil {
+		return false
+	}
+	// Copy entries and set leaderCommit to msg
+	msg.Entries = transferListToPointerList(r.RaftLog.deepCopyEntriesAfter(progress.Next))
 	if msg.Entries == nil {
 		return false
 	}
 	msg.Commit = r.RaftLog.committed
-	// Send the message by appending it to the message list
-	r.msgs = append(r.msgs, *msg)
+
+	r.sendMessage(msg)
 	return true
 }
 
@@ -226,13 +237,13 @@ func (r *Raft) sendHeartbeat(to uint64) bool {
 	if r.State != StateLeader {
 		return false
 	}
-	msg := new (pb.Message)
+	var msg pb.Message
 	msg.MsgType = pb.MessageType_MsgHeartbeat
 	msg.To = to
 	msg.From = r.id
 	msg.Term = r.Term
-	// send the message by appending it to the message list
-	r.msgs = append(r.msgs, *msg)
+
+	r.sendMessage(msg)
 	return true
 }
 
@@ -317,17 +328,90 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	switch m.MsgType {
+	case pb.MessageType_MsgAppend:
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
+	}
 	return nil
 }
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	// The leader doesn't need to handle her applyEntry request
+	if r.id == m.From {
+		return
+	}
+
+	var response pb.Message
+	response.MsgType = pb.MessageType_MsgAppendResponse
+	response.To = m.From
+	response.From = r.id
+	response.Term = r.Term
+	// 1. Reject the outdated applyEntries
+	if m.Term < r.Term {
+		response.Reject = true
+		r.sendMessage(response)
+		return
+	}
+	// 2. Reject the applyEntries with an unmatched entry
+	// at prevLogIndex in prevLogTerm
+	prevLogIndex := m.Index
+	prevLogTerm := m.LogTerm
+	actualPrevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	if prevLogTerm != actualPrevLogTerm {
+		response.Reject = true
+		r.sendMessage(response)
+		return
+	}
+	// 3. If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that follow it
+	existingEntries := r.RaftLog.deepCopyEntriesAfter(m.Index + 1)
+	// delStartIndex is the first index where the existing entry has conflict
+	// with the corresponding entry in message
+	var delStartIndex uint64
+	minLen := min(uint64(len(existingEntries)), uint64(len(m.Entries)))
+	for delStartIndex = 0; delStartIndex < minLen; delStartIndex++ {
+		if !r.RaftLog.entries[delStartIndex].IsEqualEntry(*(m.Entries[delStartIndex])) {
+			break
+		}
+	}
+	// If delStartIndex >= len(existingEntries), this operation deletes nothing
+	r.RaftLog.deleteEntriesAfter(m.Index + 1 + delStartIndex)
+	// 4. Append any new entries not already in the log
+	if delStartIndex < uint64(len(m.Entries)) {
+		r.RaftLog.entries = append(r.RaftLog.entries,
+				transferPointerListToList(m.Entries[delStartIndex:]) ...)
+	}
+	// 5. If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if m.Commit > r.RaftLog.committed {
+		lastNewEntryIndex := r.RaftLog.LastIndex()
+		r.RaftLog.committed = min(m.Commit, lastNewEntryIndex)
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	// The leader doesn't need to handle her heartbeat
+	if r.id == m.From {
+		return
+	}
+	var response pb.Message
+	response.MsgType = pb.MessageType_MsgHeartbeatResponse
+	response.To = m.From
+	response.From = r.id
+	response.Term = r.Term
+	// Reject the outdated heartbeat
+	if m.Term < r.Term {
+		response.Reject = true
+	} else {
+		response.Reject = false
+	}
+	r.sendMessage(response)
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -345,13 +429,20 @@ func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 }
 
+// sendMessage sends the message msg
+// by appending it into message list msgs
+func (r *Raft) sendMessage(msg pb.Message) {
+	r.msgs = append(r.msgs, msg)
+}
+
 // setRandomElectionTimeout sets electionTimeout
-// as rand[ electionTimeoutBase, 1.5*electionTimeoutBase ] to avoid split vote
+// as rand[electionTimeoutBase, 1.5*electionTimeoutBase] to avoid split vote
 // If electionTimeoutBase <= 0, return an error
 func (r *Raft) setRandomElectionTimeout() error {
 	if r.electionTimeoutBase <= 0 {
 		return fmt.Errorf("electionTimeoutBase should be positive")
 	}
+
 	rand.Seed(time.Now().Unix())
 	r.electionTimeout = r.electionTimeoutBase + rand.Intn(r.electionTimeoutBase) / 2
 	return nil
