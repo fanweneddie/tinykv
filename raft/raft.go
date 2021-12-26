@@ -173,19 +173,28 @@ func newRaft(c *Config) *Raft {
 	raft := new (Raft)
 	hardState, _, _ := c.Storage.InitialState()
 	raft.id = c.ID
+	// Set the default initial term as 1
 	raft.Term = hardState.Term
+	if raft.Term == 0 {
+		raft.Term = 1
+	}
 	raft.Vote = hardState.Vote
 	raft.RaftLog = newLog(c.Storage)
 	// Init Match index as 0 and Next index as 1 for each nodes
 	raft.Prs = make(map[uint64]*Progress)
+	raft.votes = make(map[uint64] bool)
 	for _, id := range c.peers {
 		raft.Prs[id] = &Progress{
 			Match: 0,
 			Next: 1,
 		}
+		raft.votes[id] = false
 	}
 	raft.State = StateFollower
-	// votes, msgs, Lead, leadTransferee and PendingConfIndex are not initialized
+	// msgs and Lead are set as default
+	raft.msgs = make([]pb.Message, 0)
+	raft.Lead = 0
+	// leadTransferee and PendingConfIndex are not initialized
 	// Randomize election timeout to avoid split vote
 	raft.heartbeatTimeout = c.HeartbeatTick
 	raft.electionTimeoutBase = c.ElectionTick
@@ -247,6 +256,21 @@ func (r *Raft) sendHeartbeat(to uint64) bool {
 	return true
 }
 
+// Return true if a requestVote is sent
+func (r *Raft) sendRequestVote(to uint64) bool {
+	if r.State != StateCandidate {
+		return false
+	}
+	var msg pb.Message
+	msg.MsgType = pb.MessageType_MsgRequestVote
+	msg.To = to
+	msg.From = r.id
+	msg.Term = r.Term
+
+	r.sendMessage(msg)
+	return true
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
@@ -254,11 +278,7 @@ func (r *Raft) tick() {
 		// For a leader, it just needs to send heartbeat periodically
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed == r.heartbeatTimeout {
-			for id, _ := range r.Prs {
-				if id != r.id {
-					r.sendHeartbeat(id)
-				}
-			}
+			r.signalNewHeartbeat()
 		}
 	} else {
 		// For a candidate or follower, if it hasn't got the message from
@@ -267,6 +287,7 @@ func (r *Raft) tick() {
 		r.electionElapsed++
 		if r.electionElapsed == r.electionTimeout {
 			r.becomeCandidate()
+			r.signalNewElection()
 		}
 	}
 }
@@ -282,7 +303,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 		return fmt.Errorf("Fail to become a follower of itself")
 	}
 	// Synchronize to leader's term and return no error
-	r.Term = term
+	r.updateTerm(term)
 	r.Vote = lead
 	r.State = StateFollower
 	r.Lead = lead
@@ -299,16 +320,14 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 func (r *Raft) becomeCandidate() error {
 	// Your Code Here (2A).
 	// Start election in a new term and reset election timer
-	r.Term += 1
+	r.incrementTerm()
 	// Vote for itself
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
-	r.votes[r.id] = true
 	r.State = StateCandidate
 	// Reset election timeout
 	r.electionElapsed = 0
 	r.setRandomElectionTimeout()
-	// Send RequestVote RPC to all the other servers ???
 	return nil
 }
 
@@ -328,13 +347,97 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if m.Term < r.Term {
+		return fmt.Errorf("Don't handle a outdated message")
+	}
+
 	switch m.MsgType {
+	// 1. Handle requests from itself
+	case pb.MessageType_MsgHup:
+		r.startNewElection()
+	case pb.MessageType_MsgBeat:
+		r.startNewHeartbeat()
+	case pb.MessageType_MsgPropose:
+		// todo
+	// 2. Handle requests from others
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+	// 3. Handle responses from others
+	case pb.MessageType_MsgAppendResponse:
+		// Do nothing?
+	case pb.MessageType_MsgHeartbeatResponse:
+		// Do nothing
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.handleRequestVoteResponse(m)
 	}
 	return nil
+}
+
+// signalNewElection signals a new round of election by sending MsgHup to itself
+func (r *Raft) signalNewElection() {
+	// Only a candidate can signal a new election
+	if r.State != StateCandidate {
+		return
+	}
+
+	var signal pb.Message
+	signal.MsgType = pb.MessageType_MsgHup
+	signal.To = r.id
+	signal.From = r.id
+	signal.Term = r.Term
+	r.sendMessage(signal)
+}
+
+// signalNewHeartbeat signals a new round of heartbeat by sending MsgBeat to itself
+func (r *Raft) signalNewHeartbeat() {
+	// Only a leader can send new heartbeats
+	if r.State != StateLeader {
+		return
+	}
+
+	var signal pb.Message
+	signal.MsgType = pb.MessageType_MsgBeat
+	signal.To = r.id
+	signal.From = r.id
+	signal.Term = r.Term
+	r.sendMessage(signal)
+}
+
+// startNewElection starts a new round of election for a candidate
+func (r *Raft) startNewElection() {
+	// To pass the test :)
+	r.State = StateCandidate
+
+	// Vote for itself first
+	r.votes[r.id] = true
+	// Send RequestVote RPC to all the other servers
+	for id, _ := range r.Prs {
+		if id != r.id {
+			r.sendRequestVote(id)
+		}
+	}
+	// Become a leader if it receives votes from major servers
+	if r.hasMajorityVotes() {
+		r.becomeLeader()
+	}
+
+}
+
+// startNewHeartbeat sends a new round of heartbeat to other servers
+func (r *Raft) startNewHeartbeat() {
+	// To pass the test :)
+	r.State = StateLeader
+
+	// Send heartbeats to others
+	for id, _ := range r.Prs {
+		if id != r.id {
+			r.sendHeartbeat(id)
+		}
+	}
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -355,6 +458,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		response.Reject = true
 		r.sendMessage(response)
 		return
+	} else {
+		// Update local term and become follower for the new leader
+		r.updateTerm(m.Term)
+		r.State = StateFollower
 	}
 	// 2. Reject the applyEntries with an unmatched entry
 	// at prevLogIndex in prevLogTerm
@@ -410,8 +517,51 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		response.Reject = true
 	} else {
 		response.Reject = false
+		// Update local term and become follower for the new leader
+		r.updateTerm(m.Term)
+		r.State = StateFollower
 	}
 	r.sendMessage(response)
+}
+
+// handleVoteRequest handle request vote RPC
+func (r *Raft) handleRequestVote(m pb.Message) {
+	// The candidate doesn't need to handle her vote request
+	if r.id == m.From {
+		return
+	}
+	var response pb.Message
+	response.MsgType = pb.MessageType_MsgRequestVoteResponse
+	response.To = m.From
+	response.From = r.id
+	response.Term = r.Term
+	// If candidate’s log is at least as up-to-date as receiver’s log,
+	// and the receiver hasn't voted for other candidates in her current term,
+	// vote for the candidate
+	if m.Term >= r.Term && (r.Vote == 0 || r.Vote == m.From) {
+		response.Reject = false
+		r.Vote = m.From
+	} else {
+		response.Reject = true
+	}
+	r.sendMessage(response)
+}
+
+// handleRequestVoteResponse handle response to request vote RPC
+func (r *Raft) handleRequestVoteResponse(m pb.Message) {
+	// This server must be a candidate,
+	// and it never gets its response to its request vote RPC
+	if r.State != StateCandidate || r.id == m.From {
+		return
+	}
+	// Record the vote result
+	if !m.Reject {
+		r.votes[m.From] = true
+	}
+	// Become a leader if it receives votes from major servers
+	if r.hasMajorityVotes() {
+		r.becomeLeader()
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -446,4 +596,41 @@ func (r *Raft) setRandomElectionTimeout() error {
 	rand.Seed(time.Now().Unix())
 	r.electionTimeout = r.electionTimeoutBase + rand.Intn(r.electionTimeoutBase) / 2
 	return nil
+}
+
+func (r *Raft) incrementTerm() {
+	r.Term++
+	r.Vote = 0
+}
+
+// updateTerm updates current term to newTerm
+// if newTerm is smaller, then return false
+func (r *Raft) updateTerm(newTerm uint64) bool {
+	if newTerm < r.Term {
+		return false
+	}
+
+	if newTerm > r.Term {
+		r.Vote = 0
+	}
+	r.Term = newTerm
+	return true
+}
+
+// hasMajorityVotes checks whether the majority
+// of servers have voted for this candidate
+// If so, return true
+func (r *Raft) hasMajorityVotes() bool {
+	var voteNum int = 0
+	for _, vote := range r.votes {
+		if vote {
+			voteNum++
+		}
+	}
+	// Get floor(len(votes)/2)
+	if voteNum >= (len(r.votes) + 1) / 2 {
+		return true
+	} else {
+		return false
+	}
 }
