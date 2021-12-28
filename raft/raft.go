@@ -170,14 +170,14 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+	// For setting random election timeout
+	rand.Seed(time.Now().Unix())
+
 	raft := new (Raft)
 	hardState, _, _ := c.Storage.InitialState()
 	raft.id = c.ID
-	// Set the default initial term as 1
+	// Note that the default initial term as 0
 	raft.Term = hardState.Term
-	if raft.Term == 0 {
-		raft.Term = 1
-	}
 	raft.Vote = hardState.Vote
 	raft.RaftLog = newLog(c.Storage)
 	// Init Match index as 0 and Next index as 1 for each nodes
@@ -278,7 +278,8 @@ func (r *Raft) tick() {
 		// For a leader, it just needs to send heartbeat periodically
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed == r.heartbeatTimeout {
-			r.signalNewHeartbeat()
+			//r.signalNewHeartbeat()
+			r.startNewHeartbeat()
 		}
 	} else {
 		// For a candidate or follower, if it hasn't got the message from
@@ -286,8 +287,7 @@ func (r *Raft) tick() {
 		// start an election
 		r.electionElapsed++
 		if r.electionElapsed == r.electionTimeout {
-			r.becomeCandidate()
-			r.signalNewElection()
+			r.startNewElection()
 		}
 	}
 }
@@ -299,12 +299,11 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 	if term < r.Term {
 		return fmt.Errorf("Fail to become a follower of an outdated leader")
 	}
-	if lead == r.Lead {
+	if lead == r.id {
 		return fmt.Errorf("Fail to become a follower of itself")
 	}
 	// Synchronize to leader's term and return no error
 	r.updateTerm(term)
-	r.Vote = lead
 	r.State = StateFollower
 	r.Lead = lead
 	// Reset election timeout
@@ -319,12 +318,9 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) error {
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() error {
 	// Your Code Here (2A).
-	// Start election in a new term and reset election timer
-	r.incrementTerm()
-	// Vote for itself
-	r.Vote = r.id
-	r.votes = make(map[uint64]bool)
+	// set a new term and reset election timer
 	r.State = StateCandidate
+	r.incrementTerm()
 	// Reset election timeout
 	r.electionElapsed = 0
 	r.setRandomElectionTimeout()
@@ -341,16 +337,13 @@ func (r *Raft) becomeLeader() {
 	r.electionElapsed = 0
 	r.setRandomElectionTimeout()
 	r.heartbeatElapsed = 0
+	r.startNewHeartbeat()
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if m.Term < r.Term {
-		return fmt.Errorf("Don't handle a outdated message")
-	}
-
 	switch m.MsgType {
 	// 1. Handle requests from itself
 	case pb.MessageType_MsgHup:
@@ -409,10 +402,18 @@ func (r *Raft) signalNewHeartbeat() {
 
 // startNewElection starts a new round of election for a candidate
 func (r *Raft) startNewElection() {
-	// To pass the test :)
-	r.State = StateCandidate
+	// A leader does not need to start an election
+	if r.State == StateLeader {
+		return
+	} else {
+		r.becomeCandidate()
+	}
 
-	// Vote for itself first
+	// Clear the messages
+	r.msgs = make([]pb.Message, 0)
+	// Vote for itself first (actually, this vote comes from last term)
+	// ???
+	r.Vote = r.id
 	r.votes[r.id] = true
 	// Send RequestVote RPC to all the other servers
 	for id, _ := range r.Prs {
@@ -429,8 +430,10 @@ func (r *Raft) startNewElection() {
 
 // startNewHeartbeat sends a new round of heartbeat to other servers
 func (r *Raft) startNewHeartbeat() {
-	// To pass the test :)
-	r.State = StateLeader
+	// Only a leader can send heartbeat to others
+	if r.State != StateLeader {
+		return
+	}
 
 	// Send heartbeats to others
 	for id, _ := range r.Prs {
@@ -461,7 +464,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	} else {
 		// Update local term and become follower for the new leader
 		r.updateTerm(m.Term)
-		r.State = StateFollower
+		r.becomeFollower(m.Term, m.From)
 	}
 	// 2. Reject the applyEntries with an unmatched entry
 	// at prevLogIndex in prevLogTerm
@@ -519,22 +522,27 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		response.Reject = false
 		// Update local term and become follower for the new leader
 		r.updateTerm(m.Term)
-		r.State = StateFollower
+		r.becomeFollower(m.Term, m.From)
 	}
 	r.sendMessage(response)
 }
 
 // handleVoteRequest handle request vote RPC
 func (r *Raft) handleRequestVote(m pb.Message) {
-	// The candidate doesn't need to handle her vote request
-	if r.id == m.From {
-		return
+	// become follower if this server is outdated
+	// (even though its potential leader may not be the leader)
+	if m.Term > r.Term {
+		r.updateTerm(m.Term)
+		r.becomeFollower(m.Term, m.From)
 	}
+
+	// Note that the candidate can handle her vote request
 	var response pb.Message
 	response.MsgType = pb.MessageType_MsgRequestVoteResponse
 	response.To = m.From
 	response.From = r.id
 	response.Term = r.Term
+
 	// If candidate’s log is at least as up-to-date as receiver’s log,
 	// and the receiver hasn't voted for other candidates in her current term,
 	// vote for the candidate
@@ -544,6 +552,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	} else {
 		response.Reject = true
 	}
+
 	r.sendMessage(response)
 }
 
@@ -586,33 +595,43 @@ func (r *Raft) sendMessage(msg pb.Message) {
 }
 
 // setRandomElectionTimeout sets electionTimeout
-// as rand[electionTimeoutBase, 1.5*electionTimeoutBase] to avoid split vote
+// as rand[electionTimeoutBase, 2*electionTimeoutBase] to avoid split vote
 // If electionTimeoutBase <= 0, return an error
 func (r *Raft) setRandomElectionTimeout() error {
 	if r.electionTimeoutBase <= 0 {
 		return fmt.Errorf("electionTimeoutBase should be positive")
 	}
 
-	rand.Seed(time.Now().Unix())
-	r.electionTimeout = r.electionTimeoutBase + rand.Intn(r.electionTimeoutBase) / 2
+	r.electionTimeout = r.electionTimeoutBase + rand.Intn(r.electionTimeoutBase)
 	return nil
 }
 
+// incrementTerm increments current term to newTerm and reset vote info
+// It is called when the current server becomes a candidate
 func (r *Raft) incrementTerm() {
 	r.Term++
 	r.Vote = 0
+	for id, _ := range r.votes {
+		r.votes[id] = false
+	}
 }
 
-// updateTerm updates current term to newTerm
+// updateTerm updates current term to newTerm and reset vote info
+// It is called when the current server is outdated, and need to be passively updated
 // if newTerm is smaller, then return false
 func (r *Raft) updateTerm(newTerm uint64) bool {
 	if newTerm < r.Term {
 		return false
 	}
 
+	// Clear the vote record
 	if newTerm > r.Term {
 		r.Vote = 0
+		for id, _ := range r.votes {
+			r.votes[id] = false
+		}
 	}
+
 	r.Term = newTerm
 	return true
 }
@@ -627,8 +646,11 @@ func (r *Raft) hasMajorityVotes() bool {
 			voteNum++
 		}
 	}
-	// Get floor(len(votes)/2)
-	if voteNum >= (len(r.votes) + 1) / 2 {
+
+	// The definition of majority: for example,
+	// If there are 4 servers, majority means at least 3 votes
+	// If there are 3 servers, majority means at least 2 votes
+	if voteNum > (len(r.votes)) / 2 {
 		return true
 	} else {
 		return false
